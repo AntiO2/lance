@@ -1466,10 +1466,13 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
     let uuid = dataset.load_indices().await.unwrap()[0].uuid;
     let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(7), 16, 4);
     dataset.delete("i % 17 = 7").await.unwrap();
+    // Keep two outputs so the next compaction actually moves their rows.
+    // A 128-row target consolidates these 241 surviving rows into one file.
     compact_files(
         &mut dataset,
         CompactionOptions {
-            target_rows_per_fragment: 128,
+            target_rows_per_fragment: 100,
+            max_rows_per_group: 16,
             defer_index_remap: true,
             ..Default::default()
         },
@@ -1477,6 +1480,7 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
     )
     .await
     .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
     let old = dataset.clone();
     let index_meta = dataset
         .load_indices()
@@ -1530,7 +1534,7 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
             .await
             .unwrap();
     } else {
-        compact_files(
+        let compacted = compact_files(
             &mut dataset,
             CompactionOptions {
                 target_rows_per_fragment: 1024,
@@ -1541,6 +1545,8 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         )
         .await
         .unwrap();
+        assert_eq!(compacted.fragments_removed, 2);
+        assert_eq!(dataset.fragments().len(), 1);
     }
     // A serialized backend restart retains bytes but no live cache entries.
     let old = if serialized {
@@ -1704,30 +1710,34 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         );
     }
     if tagged {
-        // A new index over the rewritten fragments resolves to V1Identity.
-        // Warming it must not bypass a later explicit missing-coverage plan.
+        // Identity requires coverage outside the FRI lineage, including its
+        // destinations. Append an untouched fragment and index only its rows.
+        let appended = batch.slice(0, 32);
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("identity_idx".into()),
-                &VectorIndexParams::ivf_flat(1, DistanceType::L2),
-                true,
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
             )
             .await
             .unwrap();
+        let untouched = dataset.fragments().last().unwrap().clone();
         let meta = dataset
-            .load_indices_by_name("identity_idx")
+            .create_index_builder(
+                &["vector"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            )
+            .name("identity_idx".into())
+            .fragments(vec![untouched.id as u32])
             .await
-            .unwrap()
-            .pop()
             .unwrap();
-        assert!(matches!(
-            open_row_id_remapping(&dataset, &meta, &NoOpMetricsCollector)
-                .await
-                .unwrap(),
-            Some((_, ResolvedRemapping::V1Identity))
-        ));
+        let mapping = open_row_id_remapping(&dataset, &meta, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            matches!(mapping, Some((_, ResolvedRemapping::V1Identity))),
+            "{mapping:?}"
+        );
         let index = dataset
             .open_vector_index("vector", &meta.uuid, &NoOpMetricsCollector)
             .await
@@ -1737,9 +1747,13 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
             std::slice::from_ref(&meta),
             None,
         ));
-        let first = search_global(&index, &query, filter.clone()).await.unwrap();
+        let identity_query = lazy_test_query(query.key.clone(), query.k, 1);
+        let first = search_global(&index, &identity_query, filter.clone())
+            .await
+            .unwrap();
         let truth = dataset
             .scan()
+            .with_fragments(vec![untouched])
             .nearest("vector", query.key.as_ref(), 16)
             .unwrap()
             .use_index(false)
@@ -1756,7 +1770,11 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 0);
         assert_eq!(
             result_bits(&first),
-            result_bits(&search_global(&reconstructed, &query, filter).await.unwrap())
+            result_bits(
+                &search_global(&reconstructed, &identity_query, filter)
+                    .await
+                    .unwrap()
+            )
         );
         for (reason, purpose, message) in [
             (
