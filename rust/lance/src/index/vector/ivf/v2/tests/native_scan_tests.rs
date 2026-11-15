@@ -1595,35 +1595,41 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
             &metadata,
             Some(async move { Ok(mask) }.boxed()),
         ));
-        let eager = crate::DatasetBuilder::from_uri(dir.as_str())
+        let eager_dataset = crate::DatasetBuilder::from_uri(dir.as_str())
             .with_version(view.version().version)
             .load()
             .await
-            .unwrap()
+            .unwrap();
+        let eager = eager_dataset
             .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let expected = result_bits(&search_global(&eager, &query, filter.clone()).await.unwrap());
+        // Match DatasetPreFilter: select top-k from the filtered rows, not
+        // a filtered subset of the unfiltered top-k.
         let truth = view
             .scan()
             .nearest("vector", query.key.as_ref(), 16)
             .unwrap()
             .filter("i % 3 = 0")
             .unwrap()
+            .prefilter(true)
             .use_index(false)
             .with_row_id()
             .try_into_batch()
             .await
             .unwrap();
+        assert_eq!(truth.num_rows(), query.k);
         let truth: HashSet<_> = truth[ROW_ID]
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
             .copied()
             .collect();
+        let recalled = expected.0.iter().filter(|row| truth.contains(row)).count();
         assert!(
-            expected.0.iter().filter(|row| truth.contains(row)).count() >= 8,
-            "recall >= 0.5"
+            recalled >= 8,
+            "recall >= 0.5: {recalled}/16 for view {view_id}"
         );
         let metrics = LocalMetricsCollector::default();
         let index = view
