@@ -7,7 +7,7 @@ use super::native_storage_tests::*;
 use super::*;
 use crate::index::frag_reuse::{
     MissingCoverageReason, OpenPurpose, ResolvedRemapping, SegmentRemappingPlan, fri_cache_id,
-    open_row_id_remapping, scoped_index_cache,
+    open_row_id_remapping,
 };
 use crate::index::loading::IvfIndexStateCacheKey;
 use crate::index::vector::ivf::v2::rabit_scan::{RabitCacheLayout, RabitScanScope};
@@ -20,7 +20,6 @@ use futures::{FutureExt, StreamExt};
 use lance_core::Error;
 use lance_core::cache::QuickCacheBackend;
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::row_addresses::TranslatedRowAddressesKey;
 use lance_index::vector::bq::storage::{StagePruneCounts, select_full_survivors};
 use lance_index::vector::storage::{
     ExIndex, GatherPlan, GatheredRabitEx, IndexFileKey, OriginLatencyClass, PlaneSource,
@@ -1492,8 +1491,7 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         .indice_files_dir(&index_meta)
         .unwrap()
         .join(uuid.to_string());
-    let index_path = index_dir.clone().join(lance_index::INDEX_FILE_NAME);
-    let aux_path = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
+    let index_path = index_dir.join(lance_index::INDEX_FILE_NAME);
     let state_key = IvfIndexStateCacheKey::new(&uuid, &store.store_prefix, index_path.as_ref());
     let initial = dataset
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
@@ -1576,10 +1574,6 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
             assert!(matches!(mapping, Some((_, ResolvedRemapping::V0 { .. }))));
             assert_ne!(v0_id.as_ref(), fri_cache_id(&mapping));
         }
-        let address_cache = scoped_index_cache(view, &mapping)
-            .for_index(&uuid, fri_cache_id(&mapping))
-            .with_key_prefix(&store.store_prefix)
-            .with_key_prefix(aux_path.as_ref());
         let live = view
             .scan()
             .filter("i % 3 = 0")
@@ -1644,12 +1638,24 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         let result = search_global(&index, &query, filter.clone()).await.unwrap();
         assert_eq!(result_bits(&result), expected);
         let mut view_addresses = Vec::new();
+        let native = lazy_index(&index);
         for part in 0..4 {
-            let entry = address_cache
-                .get_with_key(&TranslatedRowAddressesKey(part))
+            let sign = native
+                .storage
+                .load_sign_stage(part, &native.raw_cache, None)
                 .await
                 .unwrap();
-            view_addresses.extend_from_slice(entry.0.values());
+            let again = native
+                .storage
+                .load_sign_stage(part, &native.raw_cache, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                sign.row_ids().next().map(std::ptr::from_ref),
+                again.row_ids().next().map(std::ptr::from_ref),
+                "repeated translation must reuse the charged address buffer"
+            );
+            view_addresses.extend(sign.row_ids().copied());
         }
         addresses.push(view_addresses);
         cases.push((view, filter, expected));

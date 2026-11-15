@@ -1230,7 +1230,8 @@ async fn portable_state_schema_change_does_not_promote_unqualified_state() {
         Arc::default(),
     )
     .index_cache
-    .for_dataset(dataset.uri());
+    .for_dataset(dataset.uri())
+    .into();
     let old_key = OldStateKey(&meta.uuid);
     dataset.index_cache.insert_with_key(&old_key, state).await;
     assert!(dataset.index_cache.get_with_key(&key).await.is_none());
