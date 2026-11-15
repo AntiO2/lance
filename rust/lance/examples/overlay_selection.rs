@@ -7,7 +7,9 @@
 //! `run` measures complete consumption; use only on a managed benchmark VM.
 //!
 //! Commands: `prepare ROOT ROWS OVERLAYS VERSION`, or
-//! `verify|run ROOT full|ranges|pruned BATCH_ROWS`. VERSION is `2.2` or `2.3`.
+//! `verify|run ROOT full|ranges|pruned BATCH_ROWS [REPETITIONS]`.
+//! Repetitions share the runtime but open a new Dataset/session each time.
+//! VERSION is `2.2` or `2.3`.
 //! Release builds require the existing `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1`
 //! opt-in for these isolated overlay fixtures; do not enable it in production.
 
@@ -137,7 +139,13 @@ async fn prepare(root: &Path, fixture: Fixture) -> Result<()> {
     Ok(())
 }
 
-async fn consume(root: &Path, scenario: &str, batch_rows: u32, verify: bool) -> Result<()> {
+async fn consume(
+    root: &Path,
+    scenario: &str,
+    batch_rows: u32,
+    verify: bool,
+    repetition: usize,
+) -> Result<()> {
     if batch_rows == 0 || !matches!(scenario, "full" | "ranges" | "pruned") {
         return Err("batch rows must be positive; scenario must be full, ranges or pruned".into());
     }
@@ -220,6 +228,7 @@ async fn consume(root: &Path, scenario: &str, batch_rows: u32, verify: bool) -> 
             "scenario": scenario, "rows": rows, "batches": batches,
             "overlays": fixture.overlays, "version": fixture.version,
             "batch_rows": batch_rows, "batch_concurrency": 2,
+            "repetition": repetition,
             "verified": verify, "first_batch_us": first_batch_us,
             "full_drain_us": start.map(|start| start.elapsed().as_micros()),
         })
@@ -242,17 +251,25 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(mode @ ("verify" | "run")) if args.len() == 5 => {
-            consume(
-                Path::new(&args[2]),
-                &args[3],
-                args[4].parse()?,
-                mode == "verify",
-            )
-            .await
+        Some(mode @ ("verify" | "run")) if (5..=6).contains(&args.len()) => {
+            let repetitions: usize = args.get(5).map_or(Ok(1), |value| value.parse())?;
+            if repetitions == 0 {
+                return Err("repetitions must be positive".into());
+            }
+            for repetition in 1..=repetitions {
+                consume(
+                    Path::new(&args[2]),
+                    &args[3],
+                    args[4].parse()?,
+                    mode == "verify",
+                    repetition,
+                )
+                .await?;
+            }
+            Ok(())
         }
         _ => Err(
-            "usage: prepare ROOT ROWS OVERLAYS VERSION | verify|run ROOT full|ranges|pruned BATCH_ROWS"
+            "usage: prepare ROOT ROWS OVERLAYS VERSION | verify|run ROOT full|ranges|pruned BATCH_ROWS [REPETITIONS]"
                 .into(),
         ),
     }

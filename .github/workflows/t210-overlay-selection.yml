@@ -15,6 +15,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 2
       - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install protoc for Lance all-features lint
@@ -25,12 +27,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify overlay routing and integration
-        env:
-          LANCE_CPU_THREADS: 1
+      - name: Reuse exact unchanged implementation coverage
         run: |
-          cargo test --profile ci --locked -p lance --lib dataset::overlay:: -- --nocapture
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read -- --nocapture
+          # CI 43771362578 passed 79 overlay and 60 integration cases.
+          # This follow-up changes only the diagnostic example and this workflow.
+          git diff --exit-code fad369d8b9ea507ddd9e2dadb5b9e4d93f2af917 HEAD -- \
+            Cargo.toml Cargo.lock rust-toolchain.toml rust/lance/src \
+            rust/lance/Cargo.toml
       - name: Verify overlay diagnostic fixtures and complete results
         env:
           LANCE_CPU_THREADS: 1
@@ -40,9 +43,13 @@ jobs:
           for version in 2.2 2.3; do
             fixture="$RUNNER_TEMP/t210-overlay-$version"
             target/ci/examples/overlay_selection prepare "$fixture" 8193 4 "$version"
-            target/ci/examples/overlay_selection verify "$fixture" full 256
-            target/ci/examples/overlay_selection verify "$fixture" ranges 17
-            target/ci/examples/overlay_selection verify "$fixture" pruned 17
+            target/ci/examples/overlay_selection verify "$fixture" full 256 2
+            target/ci/examples/overlay_selection verify "$fixture" ranges 17 2
+            target/ci/examples/overlay_selection verify "$fixture" pruned 17 2
+            if target/ci/examples/overlay_selection verify "$fixture" full 256 0; then
+              echo "zero repetitions must fail"
+              exit 1
+            fi
           done
       - name: Lint touched paths
         if: ${{ !cancelled() }}
