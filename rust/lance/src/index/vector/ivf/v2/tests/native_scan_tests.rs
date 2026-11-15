@@ -1761,7 +1761,11 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result_bits(&first).0, result_bits(&truth).0);
+        // Flat partition results retain heap order; the scanner sorts them.
+        // Keep `first` unchanged for the exact reconstruction comparison below.
+        let order = arrow::compute::sort_to_indices(&first[DIST_COL], None, None).unwrap();
+        let ordered = arrow::compute::take_record_batch(&first, &order).unwrap();
+        assert_eq!(result_bits(&ordered).0, result_bits(&truth).0);
         let metrics = LocalMetricsCollector::default();
         let reconstructed = dataset
             .open_vector_index("vector", &meta.uuid, &metrics)
