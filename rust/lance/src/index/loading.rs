@@ -1007,7 +1007,10 @@ impl Dataset {
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
-        let index_file = index_dir.join(uuid.to_string()).join(INDEX_FILE_NAME);
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
         // Physical file keys also let shallow clones share immutable columns.

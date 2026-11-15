@@ -1492,7 +1492,7 @@ async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] seriali
         .indice_files_dir(&index_meta)
         .unwrap()
         .join(uuid.to_string());
-    let index_path = index_dir.join(lance_index::INDEX_FILE_NAME);
+    let index_path = index_dir.clone().join(lance_index::INDEX_FILE_NAME);
     let aux_path = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
     let state_key = IvfIndexStateCacheKey::new(&uuid, &store.store_prefix, index_path.as_ref());
     let initial = dataset
