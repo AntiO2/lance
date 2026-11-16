@@ -128,8 +128,9 @@ fn contiguous_frag_start(offsets_in_frag: &[u32]) -> Option<u32> {
 /// scan batch past the last cell this overlay touches) is skipped cheaply without
 /// inspecting individual bits.
 ///
-/// Within the batch a coverage's cells appear in ascending order, so their
-/// `offset_in_overlay` values are consecutive: the first in-batch cell sits at
+/// Borrow a bounded coverage iterator instead of allocating a batch bitmap and
+/// an intersection bitmap for every overlay. Its cells appear in ascending order,
+/// so their `offset_in_overlay` values are consecutive: the first in-batch cell sits at
 /// `offset_in_overlay = <cells this coverage has before the batch>` (a single
 /// `rank` lookup), and each following cell is one more. Coverages are applied
 /// newest-first, and the first overlay to claim a row wins.
@@ -144,12 +145,9 @@ fn route_contiguous(
     let mut indices: Vec<(usize, usize)> = (0..len).map(|row| (0, row)).collect();
     let mut any_overlay = false;
     let range_end = (frag_start as u64 + len as u64).min(u32::MAX as u64) as u32;
-    let mut batch_range = RoaringBitmap::new();
-    batch_range.insert_range(frag_start..range_end);
-
     for (k, coverage) in coverages_newest_first.iter().enumerate() {
-        let covered_in_batch = *coverage & &batch_range;
-        if covered_in_batch.is_empty() {
+        let mut covered_in_batch = coverage.range(frag_start..range_end).peekable();
+        if covered_in_batch.peek().is_none() {
             continue;
         }
         // offset_in_overlay of this coverage's first in-batch cell = the number of
@@ -159,7 +157,7 @@ fn route_contiguous(
         } else {
             coverage.rank(frag_start - 1) as u32
         };
-        for (nth_in_batch, offset_in_frag) in covered_in_batch.iter().enumerate() {
+        for (nth_in_batch, offset_in_frag) in covered_in_batch.enumerate() {
             let offset_in_batch = (offset_in_frag - frag_start) as usize;
             if indices[offset_in_batch].0 == 0 {
                 indices[offset_in_batch] = (k + 1, offsets_in_overlay[k].len());
@@ -1237,6 +1235,39 @@ mod tests {
                 "offsets_in_overlay differ"
             );
             assert_eq!(fast.any_overlay, general.any_overlay, "any_overlay differs");
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::dense_container(8192)]
+    #[case::container_boundary(65_520)]
+    #[case::last_container(u32::MAX - 8192)]
+    fn test_contiguous_routing_with_dense_and_sparse_coverage(
+        #[case] origin: u32,
+        #[values(false, true)] optimize_runs: bool,
+    ) {
+        let lower = origin - 4096;
+        let upper = origin + 4096;
+        let mut coverages = vec![
+            (lower..upper).step_by(97).collect::<RoaringBitmap>(),
+            (lower + 11..upper - 13).collect(),
+            (lower..upper).collect(),
+        ];
+        if optimize_runs {
+            for coverage in &mut coverages {
+                coverage.optimize();
+            }
+        }
+        let refs = coverages.iter().collect::<Vec<_>>();
+        // Empty, clipped and whole-container selections exercise borrowed iterator
+        // boundaries; the independent offset-major path checks rank and precedence.
+        for range in [origin..origin, origin..origin + 129, lower..upper] {
+            let offsets = range.clone().collect::<Vec<_>>();
+            let fast = route_contiguous(range.start, offsets.len(), &refs);
+            let general = route_arbitrary(&offsets, &refs);
+            assert_eq!(fast.indices, general.indices);
+            assert_eq!(fast.offsets_in_overlay, general.offsets_in_overlay);
+            assert_eq!(fast.any_overlay, general.any_overlay);
         }
     }
 

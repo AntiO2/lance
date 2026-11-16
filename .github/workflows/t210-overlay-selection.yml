@@ -27,14 +27,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Reuse exact unchanged implementation coverage
+      - name: Verify changed routing and overlay integration
+        env:
+          LANCE_CPU_THREADS: 1
         run: |
-          # CI 43771362578 passed 79 overlay and 60 integration cases.
-          # CI 43775040662 verified their source was unchanged at b77e736b8.
-          # This follow-up changes only the diagnostic example and this workflow.
-          git diff --exit-code b77e736b8a7d4a0fd87c169dadc14add078f45ae HEAD -- \
-            Cargo.toml Cargo.lock rust-toolchain.toml rust/lance/src \
-            rust/lance/Cargo.toml
+          cargo test --profile ci --locked -p lance --lib dataset::overlay::tests -- --nocapture
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read -- --nocapture
       - name: Verify overlay diagnostic fixtures and complete results
         env:
           LANCE_CPU_THREADS: 1
