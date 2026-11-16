@@ -164,10 +164,14 @@ async fn consume(
     let start = (!verify).then(Instant::now);
     let uri = root.join("data.lance").to_string_lossy().into_owned();
     let dataset = Dataset::open(&uri).await?;
+    // Cumulative checkpoints distinguish opening from selection planning and
+    // decoding. Verification mode keeps all timing disabled.
+    let dataset_open_end_us = start.map(|start| start.elapsed().as_micros());
     let fragment = dataset.get_fragment(0).ok_or("fixture has no fragment 0")?;
     let reader = fragment
         .open(dataset.schema(), FragReadConfig::default())
         .await?;
+    let fragment_open_end_us = start.map(|start| start.elapsed().as_micros());
     let mut stream = if ranges {
         let selection = (shift..fixture.rows)
             .step_by(4096)
@@ -181,6 +185,7 @@ async fn consume(
     } else {
         reader.read_all(batch_rows).await?.buffered(2).boxed()
     };
+    let stream_ready_us = start.map(|start| start.elapsed().as_micros());
     let mut first_batch_us = None;
     let mut rows = 0_u64;
     let mut batches = 0_u64;
@@ -230,6 +235,9 @@ async fn consume(
             "batch_rows": batch_rows, "batch_concurrency": 2,
             "repetition": repetition,
             "verified": verify, "first_batch_us": first_batch_us,
+            "dataset_open_end_us": dataset_open_end_us,
+            "fragment_open_end_us": fragment_open_end_us,
+            "stream_ready_us": stream_ready_us,
             "full_drain_us": start.map(|start| start.elapsed().as_micros()),
         })
     );

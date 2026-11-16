@@ -30,8 +30,9 @@ jobs:
       - name: Reuse exact unchanged implementation coverage
         run: |
           # CI 43771362578 passed 79 overlay and 60 integration cases.
+          # CI 43775040662 verified their source was unchanged at b77e736b8.
           # This follow-up changes only the diagnostic example and this workflow.
-          git diff --exit-code fad369d8b9ea507ddd9e2dadb5b9e4d93f2af917 HEAD -- \
+          git diff --exit-code b77e736b8a7d4a0fd87c169dadc14add078f45ae HEAD -- \
             Cargo.toml Cargo.lock rust-toolchain.toml rust/lance/src \
             rust/lance/Cargo.toml
       - name: Verify overlay diagnostic fixtures and complete results
