@@ -67,49 +67,29 @@ pub(super) async fn load_indices(
                 .push((position, index));
         }
     }
-    // Third state, decided once: a dropped unknown transition loses the record
-    // of which fragments it touched, so no user-index segment's stored
-    // addresses can be proven translatable (supporting the remap plugin is
-    // necessary but not sufficient when the mapping itself is gone). Exclude
-    // every such segment up front (no coverage, scan fallback) rather than grant
-    // coverage a translator cannot honor, which would drop rows silently. System
-    // indices were already passed through above, and `may_need_translation`
-    // reports true in this state as well, so this is the same decision made
-    // explicitly here without consulting the plugin registry per segment.
-    let unsupported_history = mapping.ledger.has_unsupported_transitions();
     let mut unverifiable = BTreeSet::new();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
-            if unsupported_history {
-                continue;
-            }
-            if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                // A probe that cannot reach the segment's format marker says
-                // nothing about its format, and planning every query on the
-                // table must not fail for it. Treat it as unknown for THIS
+            match coverage_membership(dataset, &mapping, index).await {
+                CoverageMembership::Member => supported.push((position, index)),
+                CoverageMembership::Excluded(_) => {}
+                // Planning every query on the table must not fail for an
+                // unreadable marker. Treat the segment as unknown for THIS
                 // call only (no coverage, scan fallback) and mark the listing
                 // for re-derivation, so the next call reclassifies once the
                 // store answers again.
-                let can_remap = match segment_supports_batch_remapping(dataset, index).await {
-                    Ok(can_remap) => can_remap.unwrap_or(false),
-                    Err(error) => {
-                        log::warn!(
-                            "index {} (segment {}): could not read its format marker ({error}); \
-                             excluding it from coverage for this query, its fragments are \
-                             scanned until the read succeeds",
-                            index.name,
-                            index.uuid,
-                        );
-                        unverifiable.insert(index.name.clone());
-                        false
-                    }
-                };
-                if index.fragment_bitmap.is_none() || !can_remap {
-                    continue;
+                CoverageMembership::Unverifiable(error) => {
+                    log::warn!(
+                        "index {} (segment {}): could not read its format marker ({error}); \
+                         excluding it from coverage for this query, its fragments are \
+                         scanned until the read succeeds",
+                        index.name,
+                        index.uuid,
+                    );
+                    unverifiable.insert(index.name.clone());
                 }
             }
-            supported.push((position, index));
         }
         // Only usable segments may establish coverage. A destination needs all
         // contributing sources; every retained contributing segment must be queried.
@@ -146,6 +126,49 @@ impl FragmentReuseIndex {
     /// Whether the history carries transitions this build cannot interpret.
     pub(crate) fn has_unsupported_transitions(&self) -> bool {
         self.ledger.has_unsupported_transitions()
+    }
+}
+
+/// Whether the tagged reader lets a user-index segment establish coverage for
+/// its logical index. None of the exclusions is a verdict that the segment
+/// covers nothing: each says this build cannot vouch for its translation.
+pub(super) enum CoverageMembership {
+    Member,
+    /// This build cannot translate it (`Unsupported`), or its details cannot
+    /// be interpreted (`Corrupt`).
+    Excluded(super::frag_reuse::MissingCoverageReason),
+    /// Its format marker could not be read, so whether it can be translated
+    /// is unknown.
+    Unverifiable(Error),
+}
+
+/// The membership rule [`load_indices`] applies to every user-index segment,
+/// shared with callers that plan a composition the manifest does not list.
+pub(super) async fn coverage_membership(
+    dataset: &Dataset,
+    mapping: &FragmentReuseIndex,
+    index: &IndexMetadata,
+) -> CoverageMembership {
+    use super::frag_reuse::MissingCoverageReason;
+    // A dropped unknown transition loses the record of which fragments it
+    // touched, so no user-index segment's stored addresses can be proven
+    // translatable (supporting the remap plugin is necessary but not
+    // sufficient when the mapping itself is gone). Exclude every such segment
+    // rather than grant coverage a translator cannot honor, which would drop
+    // rows silently. `may_need_translation` reports true in this state as
+    // well, so this is the same decision made without consulting the plugin
+    // registry per segment.
+    if !super::segment::index_is_usable(index) || mapping.ledger.has_unsupported_transitions() {
+        return CoverageMembership::Excluded(MissingCoverageReason::Unsupported);
+    }
+    if !mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
+        return CoverageMembership::Member;
+    }
+    match segment_supports_batch_remapping(dataset, index).await {
+        Ok(Some(true)) if index.fragment_bitmap.is_some() => CoverageMembership::Member,
+        Ok(Some(_)) => CoverageMembership::Excluded(MissingCoverageReason::Unsupported),
+        Ok(None) => CoverageMembership::Excluded(MissingCoverageReason::Corrupt),
+        Err(error) => CoverageMembership::Unverifiable(error),
     }
 }
 

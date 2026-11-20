@@ -30,6 +30,7 @@ use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, I
 use crate::index::append;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse;
+use crate::index::frag_reuse::MissingCoverageReason;
 use crate::index::frag_reuse_reader;
 use crate::index::frag_reuse_with_stable_row_ids::{
     has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
@@ -366,6 +367,228 @@ fn filter_unusable(indices: Arc<Vec<IndexMetadata>>) -> Arc<Vec<IndexMetadata>> 
             .cloned()
             .collect(),
     )
+}
+
+/// A same-name segment a partial commit on a tagged history may keep whole
+/// although none of its stored fragments is live: its stored bitmap is
+/// provenance the reader still translates to the live fragments rewrites
+/// produced. One whose provenance meets the incoming segments' is not a
+/// candidate: kept whole, it would contribute those source rows a second time.
+fn is_historical_candidate(
+    idx: &IndexMetadata,
+    live: &RoaringBitmap,
+    incoming_fragments: &RoaringBitmap,
+) -> bool {
+    idx.fragment_bitmap.as_ref().is_some_and(|stored| {
+        !stored.is_empty() && stored.is_disjoint(live) && stored.is_disjoint(incoming_fragments)
+    })
+}
+
+/// A retained segment outlives the commit, so its declaration has to match
+/// what is being written: `IndexDescriptionImpl::try_new` requires the same
+/// keyed and carried fields across the segments of one logical index. Nothing
+/// before this catches a disagreement, because `keyed_fields` is the prefix
+/// left after the carried ones -- a segment carrying columns keys on exactly
+/// what a plain one keys on, and both pass the keyed-field guard.
+fn check_retained_declaration(
+    index_name: &str,
+    expected: &IndexMetadata,
+    idx: &IndexMetadata,
+) -> Result<()> {
+    if idx.declares_same_fields(expected) {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
+         but retained segment {} declares fields {:?} and covering_fields {:?}; \
+         a logical index cannot mix declarations - rebuild every segment in one commit",
+        index_name,
+        expected.fields,
+        expected.covering_fields,
+        idx.uuid,
+        idx.fields,
+        idx.covering_fields
+    )))
+}
+
+fn covered_by(coverage: &[RoaringBitmap]) -> RoaringBitmap {
+    coverage
+        .iter()
+        .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap)
+}
+
+/// What a partial commit on a tagged history does with the segments whose
+/// fate depends on derived coverage.
+struct PartialCommitDecision {
+    /// Historical candidates that stay.
+    retained: HashSet<Uuid>,
+    /// Historical candidates the published composition derives nothing for.
+    dropped: Vec<IndexMetadata>,
+    /// The decision rests on coverage derived from this snapshot: a removed
+    /// segment's provenance is not wholly supplied again by the incoming
+    /// segments. Such a commit must land on the snapshot it was decided on.
+    requires_unchanged_snapshot: bool,
+}
+
+/// Decide a partial commit on a tagged history against the composition it
+/// would publish, and refuse one that would lose coverage.
+///
+/// Segments are kept or removed whole; a stored bitmap is never narrowed. A
+/// historical candidate stays when the published composition (the kept
+/// siblings, every candidate and the incoming segments, under the reader's
+/// membership rule) still derives coverage for it, so an incoming segment
+/// completing a destination together with it keeps it. The commit is then
+/// refused when a live fragment the logical index covers now would be left
+/// uncovered by the published composition.
+///
+/// A segment the reader leaves out of coverage (no batch remapper, details
+/// it cannot interpret, an unreadable format marker, a segment this build
+/// cannot open) makes every sibling's derived coverage unproven. Then every
+/// candidate stays, and a removal whose provenance the incoming segments
+/// taking part in coverage do not wholly supply again is refused: neither is
+/// decided from coverage nobody could derive.
+#[allow(clippy::too_many_arguments)]
+async fn decide_partial_composition(
+    dataset: &Dataset,
+    planner: &mut frag_reuse::CompositionPlanner,
+    index_name: &str,
+    existing: &[IndexMetadata],
+    incoming: &[IndexMetadata],
+    removed: &[IndexMetadata],
+    candidates: &HashSet<Uuid>,
+    incoming_fragments: &RoaringBitmap,
+) -> Result<PartialCommitDecision> {
+    let decided_without_coverage = || PartialCommitDecision {
+        retained: HashSet::new(),
+        dropped: Vec::new(),
+        requires_unchanged_snapshot: false,
+    };
+    // Removing only definition-only segments depends on no coverage.
+    let removes_no_provenance = removed.iter().all(|idx| {
+        idx.fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)
+    });
+    if candidates.is_empty() && removes_no_provenance {
+        return Ok(decided_without_coverage());
+    }
+
+    let group: Vec<&IndexMetadata> = existing.iter().chain(incoming.iter()).collect();
+    planner.classify(dataset, &group).await;
+    // Removing a segment whose every stored fragment an incoming coverage
+    // member stores too cannot lose a source: each destination it contributed
+    // to resolves through that incoming segment instead. An incoming segment
+    // the reader leaves out of coverage resupplies nothing.
+    let resupplied = incoming
+        .iter()
+        .filter(|idx| planner.exclusion(idx).is_none())
+        .filter_map(|idx| idx.fragment_bitmap.as_ref())
+        .fold(RoaringBitmap::new(), |supplied, stored| supplied | stored);
+    let unresupplied: Vec<&IndexMetadata> = removed
+        .iter()
+        .filter(|idx| {
+            !idx.fragment_bitmap
+                .as_ref()
+                .is_some_and(|stored| stored.is_subset(&resupplied))
+        })
+        .collect();
+    if candidates.is_empty() && unresupplied.is_empty() {
+        return Ok(decided_without_coverage());
+    }
+    let unproven: Vec<(Uuid, MissingCoverageReason)> = group
+        .iter()
+        .filter_map(|idx| planner.exclusion(idx).map(|reason| (idx.uuid, reason)))
+        .collect();
+    if !unproven.is_empty() {
+        if !unresupplied.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: cannot establish that committing these segments for '{}' keeps \
+                 the index's coverage: coverage cannot be established for {}, so removing \
+                 segments {:?}, whose fragments the incoming segments that take part in \
+                 coverage do not all store, could lose coverage nobody can see. Nothing was \
+                 committed; build the incoming segments over fragments that do not overlap \
+                 the segments being removed, or replace every segment of the index in one \
+                 commit",
+                index_name,
+                unproven
+                    .iter()
+                    .map(|(uuid, reason)| format!("segment {uuid} ({reason})"))
+                    .join(", "),
+                unresupplied.iter().map(|idx| idx.uuid).collect::<Vec<_>>(),
+            )));
+        }
+        return Ok(PartialCommitDecision {
+            retained: candidates.clone(),
+            dropped: Vec::new(),
+            requires_unchanged_snapshot: false,
+        });
+    }
+
+    let removed_uuids: HashSet<Uuid> = removed.iter().map(|idx| idx.uuid).collect();
+    let kept: Vec<&IndexMetadata> = existing
+        .iter()
+        .filter(|idx| !removed_uuids.contains(&idx.uuid))
+        .chain(incoming.iter())
+        .collect();
+    let mut retained = HashSet::new();
+    let mut dropped = Vec::new();
+    for (idx, coverage) in kept.iter().zip(planner.coverage(&kept)) {
+        if !candidates.contains(&idx.uuid) {
+            continue;
+        }
+        if coverage.is_empty() {
+            dropped.push((*idx).clone());
+        } else {
+            retained.insert(idx.uuid);
+        }
+    }
+
+    let published: Vec<&IndexMetadata> = kept
+        .iter()
+        .copied()
+        .filter(|idx| !dropped.iter().any(|gone| gone.uuid == idx.uuid))
+        .collect();
+    let existing_refs: Vec<&IndexMetadata> = existing.iter().collect();
+    let before_by_segment = planner.coverage(&existing_refs);
+    let lost = covered_by(&before_by_segment) - covered_by(&planner.coverage(&published));
+    if !lost.is_empty() {
+        let live = dataset.fragment_bitmap.as_ref();
+        let gone = |uuid: &Uuid| {
+            removed_uuids.contains(uuid) || dropped.iter().any(|gone| gone.uuid == *uuid)
+        };
+        let culprits = existing
+            .iter()
+            .zip(&before_by_segment)
+            .filter(|(idx, coverage)| gone(&idx.uuid) && !coverage.is_disjoint(&lost))
+            .map(|(idx, _)| {
+                let overlap = idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|stored| stored & live & incoming_fragments)
+                    .unwrap_or_default();
+                format!(
+                    "segment {} (live fragments the incoming segments overlap: {:?})",
+                    idx.uuid,
+                    overlap.iter().collect::<Vec<_>>()
+                )
+            })
+            .join(", ");
+        return Err(Error::invalid_input(format!(
+            "CreateIndex: committing these segments for '{}' would remove {} and leave live \
+             fragments {:?} without the index coverage they have now. Nothing was committed; \
+             build the incoming segments over fragments that do not overlap those segments' \
+             live fragments, or also over every fragment listed",
+            index_name,
+            culprits,
+            lost.iter().collect::<Vec<_>>()
+        )));
+    }
+
+    Ok(PartialCommitDecision {
+        retained,
+        requires_unchanged_snapshot: !unresupplied.is_empty() || !dropped.is_empty(),
+        dropped,
+    })
 }
 
 #[async_trait]
@@ -965,12 +1188,30 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
+        // A partial commit on a tagged history is decided on the coverage the
+        // reader derives for the composition it publishes. A replacement of
+        // every live fragment, or a type change, replaces every segment.
+        let mut planner = if is_index_type_change || missing_fragments.is_empty() {
+            None
+        } else {
+            frag_reuse::CompositionPlanner::open(self).await?
+        };
+        let is_tagged_partial = planner.is_some();
+        let historical_candidates: HashSet<Uuid> = if is_tagged_partial {
+            existing_named_indices
+                .iter()
+                .filter(|idx| is_historical_candidate(idx, &dataset_fragments, &incoming_fragments))
+                .map(|idx| idx.uuid)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
         // already declares the same fields: `build_index_metadata_from_segments`
         // compares them against each other before this point.
         let expected = &new_indices[0];
-        let removed_indices = existing_named_indices
+        let mut removed_indices = existing_named_indices
             .into_iter()
             .map(|idx| -> Result<Option<IndexMetadata>> {
                 // A logical index cannot combine segment types. Full current-fragment
@@ -992,35 +1233,50 @@ impl DatasetIndexExt for Dataset {
 
                 // A zero-fragment segment can be used to create an index while
                 // deferring the actual build. Such a segment is disjoint from every
-                // other segment but should still be removed.
+                // other segment but should still be removed. So is a segment whose
+                // fragments were all retired, unless it is a historical candidate:
+                // whether that one stays is decided on the published composition
+                // below.
                 if existing_fragments.is_empty() {
+                    if historical_candidates.contains(&idx.uuid) {
+                        return Ok(None);
+                    }
                     return Ok(Some(idx));
                 }
 
-                if existing_fragments.is_disjoint(&incoming_fragments) {
-                    // Retained, so its declaration outlives this commit and has
-                    // to match what is being written: `IndexDescriptionImpl::try_new`
-                    // requires the same keyed and carried fields across the segments
-                    // of one logical index. Nothing above catches a disagreement, because
-                    // `keyed_fields` is the prefix left after the carried ones -- a
-                    // segment carrying columns keys on exactly what a plain one
-                    // keys on, and both pass the keyed-field guard.
-                    if !idx.declares_same_fields(expected) {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
-                             but retained segment {} declares fields {:?} and covering_fields {:?}; \
-                             a logical index cannot mix declarations - rebuild every segment in one commit",
-                            index_name,
-                            expected.fields,
-                            expected.covering_fields,
-                            idx.uuid,
-                            idx.fields,
-                            idx.covering_fields
-                        )));
-                    }
+                // On a tagged history the stored bitmap is provenance: a segment
+                // sharing a retired source with the incoming segments would
+                // contribute those rows a second time, so it is replaced.
+                let shares_provenance = is_tagged_partial
+                    && idx
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|stored| !stored.is_disjoint(&incoming_fragments));
+                if existing_fragments.is_disjoint(&incoming_fragments) && !shares_provenance {
+                    check_retained_declaration(index_name, expected, &idx)?;
                     return Ok(None);
                 }
 
+                // Only the shared provenance sent a segment with disjoint live
+                // fragments here.
+                if existing_fragments.is_disjoint(&incoming_fragments) {
+                    let shared = idx
+                        .fragment_bitmap
+                        .as_ref()
+                        .map(|stored| stored & &incoming_fragments)
+                        .unwrap_or_default();
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: existing segment {} for '{}' shares already-rewritten \
+                         source fragments {:?} with the incoming segments; keeping both would \
+                         serve those rows twice. Nothing was committed; the incoming segments \
+                         must also cover its live fragments {:?}, or not include the shared \
+                         sources",
+                        idx.uuid,
+                        index_name,
+                        shared.iter().collect::<Vec<_>>(),
+                        existing_fragments.iter().collect::<Vec<_>>()
+                    )));
+                }
                 let uncovered = existing_fragments - &incoming_fragments;
                 if !uncovered.is_empty() {
                     return Err(Error::invalid_input(format!(
@@ -1037,6 +1293,28 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        let mut requires_unchanged_snapshot = false;
+        if let Some(planner) = planner.as_mut() {
+            let decision = decide_partial_composition(
+                self,
+                planner,
+                index_name,
+                &existing_snapshot,
+                &new_indices,
+                &removed_indices,
+                &historical_candidates,
+                &incoming_fragments,
+            )
+            .await?;
+            for idx in existing_snapshot
+                .iter()
+                .filter(|idx| decision.retained.contains(&idx.uuid))
+            {
+                check_retained_declaration(index_name, expected, idx)?;
+            }
+            removed_indices.extend(decision.dropped);
+            requires_unchanged_snapshot = decision.requires_unchanged_snapshot;
+        }
         // Segments that stay together must be compatible under the plugin's
         // rules (for example identical hash parameters). Segments this commit
         // removes are not consulted, so a full rebuild may change parameters.
@@ -1102,6 +1380,38 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
+        // Which segments stay was decided from the coverage derived on this
+        // snapshot, and the commit loop's rebase does not re-derive it: a
+        // concurrent commit could make the composition lose coverage. Such a
+        // commit lands only on this snapshot; otherwise the caller commits
+        // again from the latest version, which re-runs the whole decision.
+        if requires_unchanged_snapshot {
+            let read_version = self.manifest.version;
+            return match self
+                .apply_commit_with_expected_latest_version(
+                    transaction,
+                    &Default::default(),
+                    &Default::default(),
+                    Some(read_version),
+                )
+                .await
+            {
+                Err(Error::RetryableCommitConflict { version, .. }) => {
+                    Err(Error::retryable_commit_conflict_source(
+                        version,
+                        format!(
+                            "CreateIndex: the segments of '{index_name}' this commit keeps and \
+                             removes were chosen from the coverage derived at version \
+                             {read_version}, and a newer version was committed; reload the \
+                             table and commit the segments again so the choice is made against \
+                             the latest version"
+                        )
+                        .into(),
+                    ))
+                }
+                other => other,
+            };
+        }
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
