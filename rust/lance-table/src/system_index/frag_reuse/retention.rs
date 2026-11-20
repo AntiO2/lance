@@ -3,9 +3,9 @@
 
 //! Which records of a fragment reuse history some index still needs.
 //!
-//! Computed from the history's digests and the stored index metadata alone,
-//! with no payload IO, so both the maintenance trim and an action-based
-//! commit's `TrimFragReuse` reach the same verdict.
+//! Computed from the history's digests, the stored index metadata and the
+//! live fragment set alone, with no payload IO, so both the maintenance trim
+//! and an action-based commit's `TrimFragReuse` reach the same verdict.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -162,6 +162,21 @@ pub fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
     Ok(elements)
 }
 
+/// One record's lineage edge as the trim walks it: a transition, or one group
+/// of a lifted legacy version.
+struct Node {
+    element: usize,
+    sources: Vec<u64>,
+    destinations: Vec<u64>,
+}
+
+/// Memoised outcome of the settledness walk for one fragment of one group.
+enum Settlement {
+    InProgress,
+    Settled,
+    Unsettled,
+}
+
 /// One logical index's coverage as the trim sees it: provenance is the union
 /// of every stored segment bitmap (any segment, usable by this build or not,
 /// pins the records its addresses need), while direct coverage counts only
@@ -172,6 +187,123 @@ pub fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
 struct IndexGroupCoverage {
     provenance: RoaringBitmap,
     direct: RoaringBitmap,
+    /// Settledness per fragment, valid for this group's `direct` and the live
+    /// fragments of one retention computation.
+    settlement: HashMap<u64, Settlement>,
+}
+
+impl IndexGroupCoverage {
+    /// Whether no row of this group ever needs a translation out of
+    /// `fragment`: it is directly covered, or it is retired and every
+    /// destination of the record consuming it is settled in turn (a consumer
+    /// without destinations is settled). A live fragment outside `direct`,
+    /// and a retired fragment nothing consumes (a deleted fragment cannot be
+    /// told apart from missing lineage), are not settled.
+    ///
+    /// Iterative with an explicit stack so long chains cannot overflow, and
+    /// memoised so shared descendants are walked once per group. A revisit of
+    /// a fragment still in progress (a cycle) counts as not settled.
+    fn is_settled(
+        &mut self,
+        fragment: u64,
+        nodes: &[Node],
+        consumer_of: &HashMap<u64, usize>,
+        live_fragments: &RoaringBitmap,
+    ) -> bool {
+        struct Frame {
+            fragment: u64,
+            consumer: usize,
+            next_destination: usize,
+        }
+        enum Step {
+            Resolved(bool),
+            Descend(usize),
+        }
+        let Self {
+            direct, settlement, ..
+        } = self;
+        let classify = |fragment: u64| {
+            if direct.contains(fragment as u32) {
+                Step::Resolved(true)
+            } else if live_fragments.contains(fragment as u32) {
+                Step::Resolved(false)
+            } else {
+                match consumer_of.get(&fragment) {
+                    Some(&consumer) => Step::Descend(consumer),
+                    None => Step::Resolved(false),
+                }
+            }
+        };
+
+        match settlement.get(&fragment) {
+            Some(Settlement::Settled) => return true,
+            Some(_) => return false,
+            None => {}
+        }
+        let mut stack = match classify(fragment) {
+            Step::Resolved(settled) => {
+                let outcome = if settled {
+                    Settlement::Settled
+                } else {
+                    Settlement::Unsettled
+                };
+                settlement.insert(fragment, outcome);
+                return settled;
+            }
+            Step::Descend(consumer) => {
+                settlement.insert(fragment, Settlement::InProgress);
+                vec![Frame {
+                    fragment,
+                    consumer,
+                    next_destination: 0,
+                }]
+            }
+        };
+        while let Some(frame) = stack.last_mut() {
+            let current = frame.fragment;
+            let Some(&child) = nodes[frame.consumer]
+                .destinations
+                .get(frame.next_destination)
+            else {
+                stack.pop();
+                settlement.insert(current, Settlement::Settled);
+                continue;
+            };
+            frame.next_destination += 1;
+            let child_settled = match settlement.get(&child) {
+                Some(Settlement::Settled) => true,
+                Some(Settlement::Unsettled | Settlement::InProgress) => false,
+                None => match classify(child) {
+                    Step::Resolved(true) => {
+                        settlement.insert(child, Settlement::Settled);
+                        true
+                    }
+                    Step::Resolved(false) => {
+                        settlement.insert(child, Settlement::Unsettled);
+                        false
+                    }
+                    Step::Descend(consumer) => {
+                        settlement.insert(child, Settlement::InProgress);
+                        stack.push(Frame {
+                            fragment: child,
+                            consumer,
+                            next_destination: 0,
+                        });
+                        continue;
+                    }
+                },
+            };
+            if !child_settled {
+                // Each fragment on the stack needs every destination below it
+                // settled, so one unsettled descendant unsettles them all.
+                for frame in stack.drain(..) {
+                    settlement.insert(frame.fragment, Settlement::Unsettled);
+                }
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Whether some index still needs this transition to translate its rows.
@@ -180,41 +312,54 @@ struct IndexGroupCoverage {
 /// name, system indices exempt) such that:
 /// * some segment's stored provenance bitmap intersects the transition's
 ///   sources (I holds addresses the transition moves), AND
-/// * some destination is not directly covered by any USABLE segment of I
-///   (I has not fully re-derived onto the transition's output in a form this
-///   build can serve).
+/// * some destination is not settled for I. A destination is settled when a
+///   USABLE segment of I covers it directly, or when it is no longer a live
+///   fragment and every destination of the record consuming it is settled
+///   for I, recursively (a consumer without destinations is settled). A live
+///   destination outside I's direct coverage, or a retired one no record
+///   consumes, is not settled.
+///
+/// Only I's own direct coverage settles a destination for I: the reader gives
+/// direct coverage precedence per logical index, so another index's segments
+/// never stand in for I's translation.
 ///
 /// A segment without a stored bitmap imposes no constraint, mirroring the v0
 /// leniency for missing bitmaps.
 fn is_transition_needed(
     transition: &pb_fri::Transition,
-    index_groups: &HashMap<&str, IndexGroupCoverage>,
+    index_groups: &mut HashMap<&str, IndexGroupCoverage>,
+    nodes: &[Node],
+    consumer_of: &HashMap<u64, usize>,
+    live_fragments: &RoaringBitmap,
 ) -> bool {
-    index_groups.values().any(|group| {
+    index_groups.values_mut().any(|group| {
         let sources_hit = transition
             .sources
             .iter()
             .any(|source| group.provenance.contains(source.id as u32));
         sources_hit
-            && transition
-                .destinations
-                .iter()
-                .any(|destination| !group.direct.contains(destination.id as u32))
+            && transition.destinations.iter().any(|destination| {
+                !group.is_settled(destination.id, nodes, consumer_of, live_fragments)
+            })
     })
 }
 
 /// Which elements of a tagged history are still needed, from the entry's
-/// digests and the stored index metadata alone (zero payload IO).
+/// digests, the stored index metadata and the live fragment set alone (zero
+/// payload IO). `live_fragments` must be the fragments of the same manifest
+/// `indices` was read from.
 ///
 /// Legacy versions keep the exact v0 caught-up predicate; transitions use
-/// `is_transition_needed`; then transitive chain retention closes the set
-/// forward: a retained record's translation path walks through every
-/// downstream consumer of its destinations, so those records must survive
-/// too. Legacy versions retain at whole-version granularity (their groups
-/// stand or fall together, as in v0).
+/// `is_transition_needed`, whose settledness walk follows the consumer of a
+/// retired destination through later transitions and lifted legacy groups
+/// alike; then transitive chain retention closes the set forward: a retained
+/// record's translation path walks through every downstream consumer of its
+/// destinations, so those records must survive too. Legacy versions retain at
+/// whole-version granularity (their groups stand or fall together, as in v0).
 pub fn compute_tagged_retention(
     elements: &[TrimElement],
     indices: &[IndexMetadata],
+    live_fragments: &RoaringBitmap,
     is_usable: impl Fn(&IndexMetadata) -> bool,
 ) -> Vec<bool> {
     // The v0 predicate's disjointness rule is scoped to the legacy chain, as
@@ -252,39 +397,8 @@ pub fn compute_tagged_retention(
         }
     }
 
-    let mut retained = vec![false; elements.len()];
-    for (position, element) in elements.iter().enumerate() {
-        match &element.record {
-            TrimRecord::LegacyVersion(version) => {
-                let check_results = indices
-                    .iter()
-                    .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-                    .collect::<Vec<_>>();
-                if check_results
-                    .iter()
-                    .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-                {
-                    // If the check fails, the reuse version is likely corrupted,
-                    // do not retain it (v0 behavior).
-                    continue;
-                }
-                if !check_results.into_iter().all(|r| r.unwrap()) {
-                    retained[position] = true;
-                }
-            }
-            TrimRecord::Transition(transition) => {
-                retained[position] = is_transition_needed(transition, &index_groups);
-            }
-        }
-    }
-
-    // Transitive chain retention (forward closure over producer->consumer
-    // edges).
-    struct Node {
-        element: usize,
-        sources: Vec<u64>,
-        destinations: Vec<u64>,
-    }
+    // Producer->consumer edges, shared by the settledness walk and the
+    // forward closure.
     let mut nodes = Vec::new();
     for (position, element) in elements.iter().enumerate() {
         match &element.record {
@@ -315,6 +429,41 @@ pub fn compute_tagged_retention(
             .or_default()
             .push(node_index);
     }
+
+    let mut retained = vec![false; elements.len()];
+    for (position, element) in elements.iter().enumerate() {
+        match &element.record {
+            TrimRecord::LegacyVersion(version) => {
+                let check_results = indices
+                    .iter()
+                    .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
+                    .collect::<Vec<_>>();
+                if check_results
+                    .iter()
+                    .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
+                {
+                    // If the check fails, the reuse version is likely corrupted,
+                    // do not retain it (v0 behavior).
+                    continue;
+                }
+                if !check_results.into_iter().all(|r| r.unwrap()) {
+                    retained[position] = true;
+                }
+            }
+            TrimRecord::Transition(transition) => {
+                retained[position] = is_transition_needed(
+                    transition,
+                    &mut index_groups,
+                    &nodes,
+                    &consumer_of,
+                    live_fragments,
+                );
+            }
+        }
+    }
+
+    // Transitive chain retention (forward closure over producer->consumer
+    // edges).
     let mut node_retained = vec![false; nodes.len()];
     let mut queue: VecDeque<usize> = VecDeque::new();
     for (node_index, node) in nodes.iter().enumerate() {
